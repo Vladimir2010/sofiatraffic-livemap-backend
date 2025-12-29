@@ -3,3 +3,7 @@ uvicorn[standard]
 httpx
 gtfs-realtime-bindings
 psutil
+protobuf
+pytz
+websockets
+pandas

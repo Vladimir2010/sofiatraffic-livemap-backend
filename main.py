@@ -7,6 +7,8 @@ import pickle
 import os
 import gc
 import psutil
+from datetime import datetime, timedelta
+import pytz
 from fastapi import FastAPI, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 from google.transit import gtfs_realtime_pb2
@@ -15,6 +17,8 @@ GTFS_RT_VEHICLE_POSITIONS = "https://gtfs.sofiatraffic.bg/api/v1/vehicle-positio
 GTFS_RT_TRIP_UPDATES = "https://gtfs.sofiatraffic.bg/api/v1/trip-updates"
 GTFS_STATIC_PATH = "./gtfs"
 GTFS_CACHE_FILE = "gtfs_cache.pkl"
+
+SOFIA_TZ = pytz.timezone("Europe/Sofia")
 
 OCCUPANCY_MAP = {
     0: "EMPTY",
@@ -176,12 +180,15 @@ async def fetch_trip_delays():
                     if key in stop_times_map:
                         scheduled_seconds = stop_times_map[key]
 
-                        # Calculate midnight of service day
-                        est_struct = time.localtime(estimated_time)
-                        midnight_unix = time.mktime((
-                            est_struct.tm_year, est_struct.tm_mon, est_struct.tm_mday,
-                            0, 0, 0, 0, 0, -1
-                        ))
+                        # Calculate midnight of service day IN SOFIA TIME
+                        # 1. Get estimated time as UTC datetime
+                        dt_utc = datetime.fromtimestamp(estimated_time, pytz.utc)
+                        # 2. Convert to Sofia time
+                        dt_sofia = dt_utc.astimezone(SOFIA_TZ)
+                        # 3. Get midnight of that day in Sofia
+                        midnight_sofia = dt_sofia.replace(hour=0, minute=0, second=0, microsecond=0)
+                        # 4. Get timestamp of that midnight
+                        midnight_unix = midnight_sofia.timestamp()
 
                         scheduled_unix = midnight_unix + scheduled_seconds
                         current_delay = int(estimated_time - scheduled_unix)
