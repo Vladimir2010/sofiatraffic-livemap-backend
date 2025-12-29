@@ -273,6 +273,6 @@ async def websocket_livemap(ws: WebSocket):
             data = await fetch_vehicles()
             print(f"Sending {len(data)} vehicles (with delays)")
             await ws.send_json(data)
-            await asyncio.sleep(5)
+            await asyncio.sleep(2)
     except Exception as e:
         print("WS closed:", e)
