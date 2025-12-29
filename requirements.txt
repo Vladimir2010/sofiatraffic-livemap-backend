@@ -1,0 +1,223 @@
+fastapi
+uvicorn
+httpx
+gtfs-realtime-bindings
+
+
+
+import asyncio
+import time
+
+import httpx
+from fastapi import FastAPI, WebSocket
+from fastapi.middleware.cors import CORSMiddleware
+from google.transit import gtfs_realtime_pb2
+
+GTFS_URL = "https://gtfs.sofiatraffic.bg/api/v1/vehicle-positions"
+
+OCCUPANCY_MAP = {
+    0: "EMPTY",
+    1: "MANY_SEATS_AVAILABLE",
+    2: "FEW_SEATS_AVAILABLE",
+    3: "STANDING_ROOM_ONLY",
+    4: "CRUSHED_STANDING_ROOM_ONLY",
+    5: "FULL",
+    6: "NOT_ACCEPTING_PASSENGERS",
+}
+
+app = FastAPI()
+
+# Разрешаваме всички origin-и (за тест локално)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # <--- това разрешава всичко
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+async def fetch_vehicles():
+    async with httpx.AsyncClient(timeout=10) as client:
+        r = await client.get(GTFS_URL)
+        feed = gtfs_realtime_pb2.FeedMessage()
+        feed.ParseFromString(r.content)
+
+    print("DEBUG: raw feed.entities:", len(feed.entity))
+
+    vehicles = []
+
+    for entity in feed.entity:
+        print("DEBUG: entity:", entity)  # <- това показва всяка кола/тролей
+        if not entity.HasField("vehicle"):
+            continue
+
+        v = entity.vehicle
+        if not v.position or not v.trip:
+            continue
+
+        vehicle_id = v.vehicle.id if v.vehicle and v.vehicle.id else ""
+        inv_number = int("".join(filter(str.isdigit, vehicle_id))) if vehicle_id else None
+
+        # vehicles.append({
+        #     "trip": v.trip.trip_id or None,
+        #     "coords": [v.position.latitude, v.position.longitude],
+        #     "speed": int(v.position.speed or 0),
+        #     "scheduled_time": v.current_stop_sequence if v.HasField("current_stop_sequence") else None,
+        #     "next_stop": v.stop_id if v.stop_id.isdigit() else None,
+        #     "destination_stop": None,
+        #     "occupancy": (
+        #         OCCUPANCY_MAP.get(v.occupancy_status)
+        #         if v.HasField("occupancy_status")
+        #         else None
+        #     ),
+        #     "cgm_id": vehicle_id,
+        #     "inv_number": inv_number,
+        #     "cgm_route_id": v.trip.route_id,
+        #     "car": int(v.vehicle.label) if v.vehicle and v.vehicle.label.isdigit() else None,
+        #     "timestamp": v.timestamp if v.timestamp else int(time.time())
+        # })
+
+        vehicles.append({
+            "trip": v.trip.trip_id or None,
+            "route_id": v.trip.route_id or None,
+
+            "coords": [
+                v.position.latitude,
+                v.position.longitude
+            ],
+
+            "speed_kmh": round((v.position.speed or 0) * 3.6),
+            "bearing": round(v.position.bearing) if v.position.HasField("bearing") else None,
+
+            "stop_sequence": (
+                v.current_stop_sequence
+                if v.HasField("current_stop_sequence")
+                else None
+            ),
+
+            "next_stop": v.stop_id or None,
+
+            "occupancy": (
+                OCCUPANCY_MAP.get(v.occupancy_status)
+                if v.HasField("occupancy_status")
+                else None
+            ),
+
+            "vehicle_id": v.vehicle.id if v.vehicle else None,
+
+            "inv_number": inv_number,
+            "timestamp": v.timestamp or int(time.time())
+        })
+
+    print("DEBUG: processed vehicles:", vehicles[:5])  # първите 5 за проверка
+
+    return vehicles
+
+
+@app.websocket("/v2/livemap/")
+async def websocket_livemap(ws: WebSocket):
+    await ws.accept()
+    try:
+        while True:
+            data = await fetch_vehicles()
+            print(f"DEBUG: sending {len(data)} vehicles to frontend")
+            await ws.send_json(data)
+            await asyncio.sleep(3)
+    except Exception as e:
+        print("WS closed:", e)
+
+
+
+
+import csv
+import time
+import asyncio
+import httpx
+from fastapi import FastAPI, WebSocket
+from google.transit import gtfs_realtime_pb2
+
+GTFS_RT_VEHICLES = "https://gtfs.sofiatraffic.bg/api/v1/vehicle-positions"
+GTFS_RT_TRIPS = "https://gtfs.sofiatraffic.bg/api/v1/trip-updates"
+
+# -------- STATIC GTFS --------
+def load_csv(path, key):
+    data = {}
+    with open(path, encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            data[row[key]] = row
+    return data
+
+ROUTES = load_csv("gtfs/routes.txt", "route_id")
+TRIPS = load_csv("gtfs/trips.txt", "trip_id")
+STOPS = load_csv("gtfs/stops.txt", "stop_id")
+
+# -------- MAPS --------
+OCCUPANCY_MAP = {
+    0: "EMPTY",
+    1: "MANY_SEATS_AVAILABLE",
+    2: "FEW_SEATS_AVAILABLE",
+    3: "STANDING_ROOM_ONLY",
+    4: "CRUSHED_STANDING_ROOM_ONLY",
+    5: "FULL",
+}
+
+app = FastAPI()
+
+async def fetch_feed(url):
+    async with httpx.AsyncClient(timeout=10) as client:
+        r = await client.get(url)
+        feed = gtfs_realtime_pb2.FeedMessage()
+        feed.ParseFromString(r.content)
+        return feed
+
+@app.websocket("/v2/livemap/")
+async def ws_livemap(ws: WebSocket):
+    await ws.accept()
+
+    while True:
+        vehicles_feed = await fetch_feed(GTFS_RT_VEHICLES)
+        trips_feed = await fetch_feed(GTFS_RT_TRIPS)
+
+        delays = {}
+        for e in trips_feed.entity:
+            if e.HasField("trip_update"):
+                tu = e.trip_update
+                delays[tu.trip.trip_id] = tu.delay
+
+        result = []
+
+        for e in vehicles_feed.entity:
+            if not e.HasField("vehicle"):
+                continue
+
+            v = e.vehicle
+            trip_id = v.trip.trip_id
+            trip = TRIPS.get(trip_id)
+            route = ROUTES.get(v.trip.route_id)
+            stop = STOPS.get(v.stop_id)
+
+            speed_kmh = int((v.position.speed or 0))
+
+            result.append({
+                "vehicle_id": v.vehicle.id,
+                "inv_number": int("".join(filter(str.isdigit, v.vehicle.id))),
+                "route_id": v.trip.route_id,
+                "route_name": route["route_short_name"] if route else None,
+                "trip_id": trip_id,
+                "headsign": trip["trip_headsign"] if trip else None,
+                "coords": [v.position.latitude, v.position.longitude],
+                "speed_kmh": speed_kmh,
+                "delay_seconds": delays.get(trip_id),
+                "delay_minutes": (
+                    delays.get(trip_id) // 60
+                    if delays.get(trip_id) is not None else None
+                ),
+                "current_stop_id": v.stop_id,
+                "current_stop_name": stop["stop_name"] if stop else None,
+                "occupancy": OCCUPANCY_MAP.get(v.occupancy_status),
+                "timestamp": v.timestamp or int(time.time())
+            })
+
+        await ws.send_json(result)
+        await asyncio.sleep(3)
